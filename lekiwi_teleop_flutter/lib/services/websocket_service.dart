@@ -2,26 +2,41 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:shelf/shelf_io.dart' as shelf_io;
-import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
-import 'package:network_info_plus/network_info_plus.dart';
+import 'package:web_socket_channel/io.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'log_service.dart';
 
 class WebSocketService {
-  HttpServer? _server;
   WebSocketChannel? _channel;
+  Timer? _reconnectTimer;
+  Timer? _sendTimer;
+  final _log = LogService.instance;
+  static const _tag = 'WS';
+  int _connectAttempt = 0;
 
   final StreamController<Map<String, dynamic>> _messageController = StreamController.broadcast();
   final StreamController<bool> _connectionController = StreamController.broadcast();
-  final StreamController<String?> _ipController = StreamController.broadcast();
+  final StreamController<String?> _statusController = StreamController.broadcast();
 
   // Public streams
   Stream<Map<String, dynamic>> get messageStream => _messageController.stream;
   Stream<bool> get connectionStream => _connectionController.stream;
-  Stream<String?> get ipStream => _ipController.stream;
+  Stream<String?> get statusStream => _statusController.stream;
 
   bool get isConnected => _channel != null;
-  String? _deviceIp;
+
+  // Training telemetry
+  bool _trainingActive = false;
+  bool get trainingActive => _trainingActive;
+  final StreamController<bool> _trainingController = StreamController.broadcast();
+  Stream<bool> get trainingStream => _trainingController.stream;
+
+  // Bridge URL (configurable, persisted)
+  String _bridgeUrl = 'ws://pbot.pullen.loc:30808';
+  String get bridgeUrl => _bridgeUrl;
+
+  static const String _prefKey = 'bridge_url';
 
   // Current velocity commands to send to Python
   double _xVel = 0.0;
@@ -37,95 +52,149 @@ class WebSocketService {
   static const double maxRotationVel = 60.0;
   static const double maxWristFlexVel = 1.0;
 
-  Future<String?> _findLocalIp() async {
-    try {
-      // List all network interfaces
-      final interfaces = await NetworkInterface.list(
-        includeLoopback: false,
-        type: InternetAddressType.IPv4,
-      );
-
-      for (final interface in interfaces) {
-        // Log interface details for debugging
-        debugPrint('🔎 Interface: ${interface.name}');
-        for (final addr in interface.addresses) {
-          debugPrint('  - Address: ${addr.address}, type: ${addr.type}');
-          // When hotspot is active on Android, the IP is typically 192.168.x.x
-          // On iOS, it's often 172.20.x.x
-          // These are common private IP ranges for local networks.
-          if (!addr.isLoopback && addr.type == InternetAddressType.IPv4) {
-            // Prioritize hotspot/local wifi IPs
-            if (addr.address.startsWith('192.168.') || addr.address.startsWith('172.20.')) {
-              debugPrint('✅ Found potential hotspot IP: ${addr.address}');
-              return addr.address;
-            }
-          }
-        }
-      }
-
-      // Fallback for standard WiFi connection if no hotspot IP was found
-      final wifiIP = await NetworkInfo().getWifiIP();
-      if (wifiIP != null) {
-        debugPrint('✅ Found WiFi IP via fallback: $wifiIP');
-        return wifiIP;
-      }
-    } catch (e) {
-      debugPrint('❌ Error getting local IP: $e');
+  Future<void> loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_prefKey);
+    if (saved != null && saved != 'wss://pbot.pullen.loc' && saved != 'ws://pbot.pullen.loc') {
+      _bridgeUrl = saved;
     }
-
-    // Final fallback if everything else fails
-    debugPrint('⚠️ Could not determine local IP. Falling back to 0.0.0.0');
-    return '0.0.0.0';
+    _log.i(_tag, 'loadSettings: url=$_bridgeUrl');
   }
 
-  Future<void> startServer() async {
-    if (_server != null) {
-      debugPrint('Server already running.');
+  Future<void> setBridgeUrl(String url) async {
+    _bridgeUrl = url;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefKey, url);
+  }
+
+  Future<void> connect() async {
+    await loadSettings();
+    _connectAttempt = 0;
+    _log.i(_tag, 'connect() called, url=$_bridgeUrl');
+    _statusController.add('Connecting to $_bridgeUrl ...');
+    _doConnect();
+  }
+
+  void _doConnect() async {
+    _reconnectTimer?.cancel();
+    _connectAttempt++;
+    _log.i(_tag, '--- Connection attempt #$_connectAttempt ---');
+
+    final uri = Uri.parse(_bridgeUrl);
+    _log.i(_tag, 'Parsed URI: scheme=${uri.scheme} host=${uri.host} port=${uri.port}');
+
+    // Network diagnostics on first attempt and every 10th
+    if (_connectAttempt == 1 || _connectAttempt % 10 == 0) {
+      await _logNetworkDiagnostics(uri.host);
+    }
+
+    // DNS resolution check
+    try {
+      final stopwatch = Stopwatch()..start();
+      final addrs = await InternetAddress.lookup(uri.host);
+      stopwatch.stop();
+      _log.i(_tag, 'DNS resolved ${uri.host} -> ${addrs.map((a) => "${a.address} (${a.type.name})").join(", ")} (${stopwatch.elapsedMilliseconds}ms)');
+    } catch (e) {
+      _log.e(_tag, 'DNS lookup FAILED for ${uri.host}: $e');
+      // Try IPv4-only lookup as fallback
+      try {
+        final addrs4 = await InternetAddress.lookup(uri.host, type: InternetAddressType.IPv4);
+        _log.i(_tag, 'IPv4-only lookup succeeded: ${addrs4.map((a) => a.address).join(", ")}');
+      } catch (e4) {
+        _log.e(_tag, 'IPv4-only lookup also FAILED: $e4');
+      }
+      // Try a known host to verify DNS works at all
+      try {
+        final google = await InternetAddress.lookup('google.com');
+        _log.i(_tag, 'google.com resolves OK -> ${google.first.address} (DNS is working for public domains)');
+      } catch (eg) {
+        _log.e(_tag, 'google.com also FAILED -> DNS is completely broken: $eg');
+      }
+      _statusController.add('DNS failed: ${uri.host}');
+      _scheduleReconnect();
       return;
     }
 
+    // WebSocket connect
     try {
-      _deviceIp = await _findLocalIp();
-      _ipController.add(_deviceIp);
-      debugPrint('📱 Phone IP: $_deviceIp');
+      _log.i(_tag, 'Opening WebSocket to $uri ...');
+      _channel = IOWebSocketChannel.connect(
+        uri,
+        connectTimeout: const Duration(seconds: 10),
+      );
 
-      var handler = webSocketHandler((WebSocketChannel webSocket, String? protocol) {
-        debugPrint('🤖 Robot connected!');
-        _channel = webSocket;
-        _connectionController.add(true);
-
-        _channel!.stream.listen(
-          (message) {
-            try {
-              final data = json.decode(message);
-              debugPrint('📨 Received from robot: ${data['type']}');
-              
-              // Handle observation data from Python
-              if (data['type'] == 'observation') {
-                _messageController.add(data);
-              }
-            } catch (e) {
-              debugPrint('❌ Error decoding robot message: $e');
+      _channel!.stream.listen(
+        (message) {
+          try {
+            final data = json.decode(message);
+            if (data['type'] == 'observation') {
+              _messageController.add(data);
             }
-          },
-          onDone: () {
-            debugPrint('🤖 Robot disconnected.');
-            _connectionController.add(false);
-            _channel = null;
-          },
-          onError: (error) {
-            debugPrint('❌ Robot connection error: $error');
-            _connectionController.add(false);
-            _channel = null;
-          },
-        );
-      });
+          } catch (e) {
+            _log.e(_tag, 'Decode error: $e');
+          }
+        },
+        onDone: () {
+          final code = _channel?.closeCode;
+          final reason = _channel?.closeReason;
+          _log.w(_tag, 'Stream onDone: closeCode=$code reason=$reason');
+          _channel = null;
+          _connectionController.add(false);
+          _statusController.add('Disconnected (code=$code). Reconnecting...');
+          _scheduleReconnect();
+        },
+        onError: (error, stackTrace) {
+          _log.e(_tag, 'Stream onError: $error');
+          _log.e(_tag, 'Stack: $stackTrace');
+          _channel = null;
+          _connectionController.add(false);
+          _statusController.add('Error: $error');
+          _scheduleReconnect();
+        },
+      );
 
-      _server = await shelf_io.serve(handler, _deviceIp ?? '0.0.0.0', 8080);
-      debugPrint('✅ WebSocket server started on ws://${_server!.address.host}:${_server!.port}');
-    } catch (e) {
-      debugPrint('❌ Error starting server: $e');
+      _connectionController.add(true);
+      _statusController.add('Connected to $_bridgeUrl');
+      _log.i(_tag, 'Connected successfully (attempt #$_connectAttempt)');
+    } catch (e, st) {
+      _log.e(_tag, 'Connect exception: $e');
+      _log.e(_tag, 'Stack: $st');
+      _statusController.add('Failed: $e');
+      _scheduleReconnect();
     }
+  }
+
+  void _scheduleReconnect() {
+    _reconnectTimer?.cancel();
+    _log.i(_tag, 'Will reconnect in 3s...');
+    _reconnectTimer = Timer(const Duration(seconds: 3), _doConnect);
+  }
+
+  Future<void> _logNetworkDiagnostics(String host) async {
+    _log.i(_tag, '=== Network Diagnostics ===');
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.any,
+      );
+      for (final iface in interfaces) {
+        final addrs = iface.addresses.map((a) => '${a.address}(${a.type.name})').join(', ');
+        _log.i(_tag, 'Interface: ${iface.name} -> $addrs');
+      }
+    } catch (e) {
+      _log.e(_tag, 'Failed to list interfaces: $e');
+    }
+
+    // Test DNS for known hosts
+    for (final testHost in [host, 'google.com', 'pihole.pullen.loc']) {
+      try {
+        final addrs = await InternetAddress.lookup(testHost);
+        _log.i(_tag, 'DNS $testHost -> ${addrs.map((a) => a.address).join(", ")}');
+      } catch (e) {
+        _log.e(_tag, 'DNS $testHost -> FAILED: $e');
+      }
+    }
+    _log.i(_tag, '=== End Diagnostics ===');
   }
 
   // Apply deadzone logic: 0-15% = 0, 15-30% = proportional 0-30%, 30%+ = actual
@@ -251,24 +320,37 @@ class WebSocketService {
     try {
       _channel?.sink.add(json.encode(message));
     } catch (e) {
-      debugPrint('❌ Error sending message: $e');
+      _log.e(_tag, 'Send error: $e');
     }
   }
 
-  Future<void> stopServer() async {
-    debugPrint('🔌 Stopping server...');
+  void toggleTraining() {
+    _trainingActive = !_trainingActive;
+    _trainingController.add(_trainingActive);
+    final msg = {'type': _trainingActive ? 'training_start' : 'training_stop'};
+    _log.i(_tag, 'Training ${_trainingActive ? "STARTED" : "STOPPED"}');
+    _sendMessage(msg);
+  }
+
+  void sendHome() {
+    _log.i(_tag, 'Sending HOME command');
+    _sendMessage({'type': 'home'});
+  }
+
+  Future<void> disconnect() async {
+    _log.i(_tag, 'disconnect() called');
+    _reconnectTimer?.cancel();
     await _channel?.sink.close();
-    await _server?.close(force: true);
-    _server = null;
     _channel = null;
     _connectionController.add(false);
-    debugPrint('🛑 Server stopped.');
+    _statusController.add('Disconnected');
+    _log.i(_tag, 'Disconnected.');
   }
 
   void dispose() {
-    stopServer();
+    disconnect();
     _messageController.close();
     _connectionController.close();
-    _ipController.close();
+    _statusController.close();
   }
 } 

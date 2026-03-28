@@ -26,11 +26,13 @@ class _TeleopScreenState extends State<TeleopScreen> {
   VideoDisplayMode _videoDisplayMode = VideoDisplayMode.dual;
   Map<String, dynamic>? _latestObservationData;
   StreamSubscription<GyroscopeEvent>? _gyroscopeSubscription;
+  bool _frontFlipped = false;
+  bool _wristFlipped = false;
 
   @override
   void initState() {
     super.initState();
-    _webSocketService.startServer();
+    _webSocketService.connect();
     _webSocketService.messageStream.listen((message) {
       if (message['type'] == 'observation' && mounted) {
         setState(() => _latestObservationData = message);
@@ -64,17 +66,9 @@ class _TeleopScreenState extends State<TeleopScreen> {
               padding: const EdgeInsets.all(16),
               child: Stack(
                 children: [
-                  // Top bar with connection status (when not connected)
-                  Positioned(
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    child: ConnectionWidget(webSocketService: _webSocketService),
-                  ),
-
                   // Robot State - top right corner (moved down for better visibility)
                   Positioned(
-                    top: 12, // Moved down from -4 to 12
+                    top: 12,
                     right: 0,
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.end,
@@ -91,6 +85,21 @@ class _TeleopScreenState extends State<TeleopScreen> {
                   if (_manipulatorMode) ..._buildManipulatorControls(),
                 ],
               ),
+            ),
+          ),
+
+          // Bottom bar: Home/Rec + Connection status
+          Positioned(
+            bottom: 4,
+            left: 0,
+            right: 0,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _buildTrainingHomeButtons(),
+                const SizedBox(width: 8),
+                ConnectionWidget(webSocketService: _webSocketService),
+              ],
             ),
           ),
         ],
@@ -183,6 +192,73 @@ class _TeleopScreenState extends State<TeleopScreen> {
     );
   }
 
+  Widget _buildTrainingHomeButtons() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Home button
+        GestureDetector(
+          onTap: () => _webSocketService.sendHome(),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.blueGrey.shade800.withOpacity(0.85),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.blueGrey.shade400, width: 1),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.home, color: Colors.white, size: 18),
+                const SizedBox(width: 4),
+                const Text('Home', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w600)),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        // Training record/stop button
+        StreamBuilder<bool>(
+          stream: _webSocketService.trainingStream,
+          initialData: _webSocketService.trainingActive,
+          builder: (context, snapshot) {
+            final active = snapshot.data ?? false;
+            return GestureDetector(
+              onTap: () => _webSocketService.toggleTraining(),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: active ? Colors.red.shade900.withOpacity(0.85) : Colors.blueGrey.shade800.withOpacity(0.85),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: active ? Colors.red : Colors.blueGrey.shade400, width: 1),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      active ? Icons.stop_circle : Icons.fiber_manual_record,
+                      color: active ? Colors.red.shade300 : Colors.red,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      active ? 'Stop' : 'Rec',
+                      style: TextStyle(
+                        color: active ? Colors.red.shade300 : Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+
   Widget _buildVideoBackground() {
     switch (_videoDisplayMode) {
       case VideoDisplayMode.dual:
@@ -193,7 +269,9 @@ class _TeleopScreenState extends State<TeleopScreen> {
               child: VideoDisplayWidget(
                 observationData: _latestObservationData, 
                 cameraKey: 'front',
+                flipped: _frontFlipped,
                 onTitleTap: () => setState(() => _videoDisplayMode = VideoDisplayMode.frontFullscreen),
+                onFlipTap: () => setState(() => _frontFlipped = !_frontFlipped),
               )
             ),
             // Wrist camera (right side)  
@@ -201,7 +279,9 @@ class _TeleopScreenState extends State<TeleopScreen> {
               child: VideoDisplayWidget(
                 observationData: _latestObservationData, 
                 cameraKey: 'wrist',
+                flipped: _wristFlipped,
                 onTitleTap: () => setState(() => _videoDisplayMode = VideoDisplayMode.wristFullscreen),
+                onFlipTap: () => setState(() => _wristFlipped = !_wristFlipped),
               )
             ),
           ],
@@ -213,7 +293,9 @@ class _TeleopScreenState extends State<TeleopScreen> {
             VideoDisplayWidget(
               observationData: _latestObservationData, 
               cameraKey: 'front',
+              flipped: _frontFlipped,
               onTitleTap: () => setState(() => _videoDisplayMode = VideoDisplayMode.dual),
+              onFlipTap: () => setState(() => _frontFlipped = !_frontFlipped),
             ),
             // Wrist camera thumbnail in top-left
             Positioned(
@@ -226,6 +308,7 @@ class _TeleopScreenState extends State<TeleopScreen> {
                   observationData: _latestObservationData, 
                   cameraKey: 'wrist',
                   isThumbnail: true,
+                  flipped: _wristFlipped,
                   onTitleTap: () => setState(() => _videoDisplayMode = VideoDisplayMode.dual),
                 ),
               ),
@@ -239,7 +322,9 @@ class _TeleopScreenState extends State<TeleopScreen> {
             VideoDisplayWidget(
               observationData: _latestObservationData, 
               cameraKey: 'wrist',
+              flipped: _wristFlipped,
               onTitleTap: () => setState(() => _videoDisplayMode = VideoDisplayMode.dual),
+              onFlipTap: () => setState(() => _wristFlipped = !_wristFlipped),
             ),
             // Front camera thumbnail in top-left
             Positioned(
@@ -252,6 +337,7 @@ class _TeleopScreenState extends State<TeleopScreen> {
                   observationData: _latestObservationData, 
                   cameraKey: 'front',
                   isThumbnail: true,
+                  flipped: _frontFlipped,
                   onTitleTap: () => setState(() => _videoDisplayMode = VideoDisplayMode.dual),
                 ),
               ),

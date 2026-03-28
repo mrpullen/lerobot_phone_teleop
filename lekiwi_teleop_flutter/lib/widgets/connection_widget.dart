@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/websocket_service.dart';
+import 'log_viewer_widget.dart';
 
 class ConnectionWidget extends StatelessWidget {
   final WebSocketService webSocketService;
@@ -17,9 +18,34 @@ class ConnectionWidget extends StatelessWidget {
       builder: (context, connectionSnapshot) {
         final isConnected = connectionSnapshot.data ?? false;
 
-        // Only show when NOT connected to save space
         if (isConnected) {
-          return const SizedBox.shrink(); // Hide when connected
+          // Show minimal connected indicator with settings access
+          return GestureDetector(
+            onTap: () => _showSettingsDialog(context),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.green.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.circle, color: Colors.green.shade400, size: 10),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Connected',
+                    style: TextStyle(color: Colors.green.shade300, fontSize: 12),
+                  ),
+                  const SizedBox(width: 8),
+                  GestureDetector(
+                    onTap: () => showLogViewer(context),
+                    child: Icon(Icons.article_outlined, color: Colors.green.shade400, size: 16),
+                  ),
+                ],
+              ),
+            ),
+          );
         }
 
         return Container(
@@ -31,57 +57,43 @@ class ConnectionWidget extends StatelessWidget {
             ),
             borderRadius: BorderRadius.circular(8),
           ),
-          child: _buildListeningWidget(),
+          child: _buildConnectingWidget(context),
         );
       },
     );
   }
 
-  Widget _buildListeningWidget() {
+  Widget _buildConnectingWidget(BuildContext context) {
     return StreamBuilder<String?>(
-      stream: webSocketService.ipStream,
-      builder: (context, ipSnapshot) {
-        final ipAddress = ipSnapshot.data;
-        if (ipAddress == null) {
-          return Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade300),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Text(
-                'Initializing server...',
-                style: TextStyle(color: Colors.blue.shade300, fontSize: 14),
-              ),
-            ],
-          );
-        }
-
+      stream: webSocketService.statusStream,
+      builder: (context, statusSnapshot) {
+        final status = statusSnapshot.data ?? 'Initializing...';
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.radar, color: Colors.blue.shade300, size: 20),
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade300),
+              ),
+            ),
             const SizedBox(width: 12),
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  'Waiting for Robot...',
+                  status,
                   style: TextStyle(
                     fontWeight: FontWeight.bold,
-                    fontSize: 14,
+                    fontSize: 13,
                     color: Colors.blue.shade300,
                   ),
                 ),
                 Text(
-                  'ws://$ipAddress:8080',
+                  webSocketService.bridgeUrl,
                   style: TextStyle(
                     fontSize: 11,
                     fontFamily: 'monospace',
@@ -90,9 +102,56 @@ class ConnectionWidget extends StatelessWidget {
                 ),
               ],
             ),
+            const SizedBox(width: 12),
+            GestureDetector(
+              onTap: () => _showSettingsDialog(context),
+              child: Icon(Icons.settings, color: Colors.blue.shade300, size: 20),
+            ),
+            const SizedBox(width: 8),
+            GestureDetector(
+              onTap: () => showLogViewer(context),
+              child: Icon(Icons.article_outlined, color: Colors.blue.shade300, size: 20),
+            ),
           ],
         );
       },
+    );
+  }
+
+  void _showSettingsDialog(BuildContext context) {
+    final controller = TextEditingController(text: webSocketService.bridgeUrl);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Bridge URL'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            hintText: 'ws://pbot.pullen.loc:30808',
+            labelText: 'WebSocket URL',
+          ),
+          keyboardType: TextInputType.url,
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              final url = controller.text.trim();
+              if (url.isNotEmpty) {
+                await webSocketService.setBridgeUrl(url);
+                await webSocketService.disconnect();
+                webSocketService.connect();
+              }
+              Navigator.pop(ctx);
+            },
+            child: const Text('Save & Reconnect'),
+          ),
+        ],
+      ),
     );
   }
 } 
